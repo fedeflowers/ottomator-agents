@@ -8,6 +8,8 @@ import json
 import logfire
 from supabase import Client
 from openai import AsyncOpenAI
+import re
+from urllib.parse import urlparse
 
 # Import all the message part classes
 from pydantic_ai.messages import (
@@ -24,6 +26,8 @@ from pydantic_ai.messages import (
 )
 from expert import Agent_expert, PydanticAIDeps
 from expert import *
+from crawl_docs import WebCrawler
+from crawl_docs import *
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -124,6 +128,20 @@ async def save_chat_to_supabase(role: str, content: str, source: str):
         print(f"Error saving chat to database: {e}")
         st.error("Failed to save chat")
 
+async def save_domain_to_supabase(domain: str):
+    """
+    Save domain to Supabase.
+    """
+    msg = {
+        "doc_type": domain,
+    }
+    
+    try:
+        response = supabase.table("documentation").insert(msg).execute()
+    except Exception as e:
+        print(f"Error saving domain to database: {e}")
+        st.error("Failed to save domain")
+
 
 async def load_chats_from_supabase(source: str):
     """
@@ -157,24 +175,113 @@ def display_chat(chat_data):
             with user_container:
                 st.markdown(f"**System**: {content}")
 
+def retrieve_docs_list(collection):
+    try:
+        res = []
+        response = supabase.table(collection).select("doc_type").execute()
+        for el in response.data:
+            res.append(el["doc_type"])
+        return res
+    except Exception as e:
+        print(f"Error loading games from database: {e}")
+        st.error("Failed to load docs from database")
 
+def is_valid_sitemap(url):
+    """
+    Validate if the given URL follows the correct sitemap format: 
+    'https://<domain>/sitemap.xml'
+    """
+    pattern = r"^https:\/\/[\w.-]+\/sitemap\.xml$"
+    return re.match(pattern, url) is not None
+def extract_domain_from_sitemap(url):
+    """
+    Extracts the domain from a given sitemap URL.
+
+    Example:
+    Input:  'https://spark.apache.org/sitemap.xml'
+    Output: 'spark.apache.org'
+    """
+    parsed_url = urlparse(url)
+    return parsed_url.netloc
+
+
+async def crawl_and_store(url):
+    try:
+        if is_valid_sitemap(url):
+            st.session_state.site_map = url
+            st.sidebar.success(f"Valid sitemap URL submitted: {url}")
+
+            # Extract domain and initialize WebCrawler
+            domain = extract_domain_from_sitemap(url)
+            st.session_state.crawler = WebCrawler(domain)
+
+            # Save domain asynchronously to Supabase
+            await save_domain_to_supabase(domain)
+
+            # Start crawling the sitemap URL
+            await st.session_state.crawler.main(url)
+
+            st.sidebar.success("Crawling completed successfully!")
+        else:
+            st.sidebar.error("Invalid sitemap format. Use: https://example.com/sitemap.xml")
+    except Exception as e:
+        st.sidebar.error(f"An error occurred: {e}")
+    
 async def main():
     if "to_init" not in st.session_state:
+        st.session_state.docs = "documentation"
         st.session_state.to_init = False
         llm = os.getenv('LLM_MODEL', 'gpt-4o-mini')
-        model = OpenAIModel(llm)
-        st.session_state.agent = Agent_expert("pyspark", model = model, doc_source= "pydantic_ai_docs")
+        st.session_state.model = OpenAIModel(llm)
+        st.session_state.crawler = WebCrawler("pyspark")
+        st.session_state.site_map = "https://spark.apache.org/sitemap.xml"
+        #if no docs found, crawl a doc to start
+        try:
+            st.session_state.selected_doc = retrieve_docs_list(st.session_state.docs)[-1]
+        except:
+            pass
+        
+    # SIDEBAR PREVIOUS CONVERSATIONS
+    doc_options = retrieve_docs_list(st.session_state.docs)
+
+    # Store the selected dpc in session state
+    if len(doc_options) != 0 :
+        st.sidebar.title("Previous Conversations")
+    else:
+        st.sidebar.markdown("No docs found, <br> crawl a dococumentation to start", unsafe_allow_html=True)
+
+    if "selected_doc" in st.session_state:
+        selected_doc = st.sidebar.selectbox("Select a doc:", doc_options, index=doc_options.index(st.session_state.selected_doc))
+        #instantiate agent
+        #change pydantic_ai_docs to the selected doc
+        st.session_state.agent = Agent_expert(selected_doc, model = st.session_state.model, doc_source= "pydantic_ai_docs")
+        st.session_state.previous_chats = await load_chats_from_supabase(source=selected_doc)
         st.title(f"{st.session_state.agent.agent_scope} AI Agentic RAG")
         st.write(f"Ask any question about {st.session_state.agent.agent_scope}, the hidden truths of the beauty of this framework lie within.")
-        st.session_state.previous_chats = await load_chats_from_supabase(source="pyspark")
-        
 
-    agent = st.session_state.agent
-    display_chat(st.session_state.previous_chats)
-    
+    if "previous_chats" in st.session_state:
+        display_chat(st.session_state.previous_chats)
 
 
-    # Initialize chat history in session state if not present
+    # Update selected doc only when the selection changes
+    if "selected_doc" in st.session_state:
+        if selected_doc != st.session_state.selected_doc:
+            st.session_state.selected_doc = selected_doc
+            st.rerun()
+
+
+    st.sidebar.divider()
+    # # crawl doc button
+    st.sidebar.header("Crawl Document")
+    url = st.sidebar.text_input("Enter URL to crawl:", "")
+
+    if st.sidebar.button("Crawl Doc"):
+        if url:
+            asyncio.create_task(crawl_and_store(url))  # Run the async task without blocking UI
+        else:
+            st.sidebar.warning("Please enter a valid URL.")
+
+    # # Initialize chat history in session state if not present
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -187,25 +294,26 @@ async def main():
                 display_message_part(part)
 
     # Chat input for the user
-    user_input = st.chat_input(f"What questions do you have about {agent.agent_scope}?", key="user_input")
+    if "agent" in st.session_state:
+        user_input = st.chat_input(f"What questions do you have about {st.session_state.agent.agent_scope}?", key="user_input")
 
-    if user_input:
-        st.session_state.messages.append(
-            ModelRequest(parts=[UserPromptPart(content=user_input)])
-        )
-        await save_chat_to_supabase("user", user_input, source=agent.agent_scope)
+        if user_input:
+            st.session_state.messages.append(
+                ModelRequest(parts=[UserPromptPart(content=user_input)])
+            )
+            await save_chat_to_supabase("user", user_input, source=st.session_state.agent.agent_scope)
 
-        with st.chat_message("user", avatar=USER_ICON):
-            st.markdown(user_input)
+            with st.chat_message("user", avatar=USER_ICON):
+                st.markdown(user_input)
 
-        with st.chat_message("assistant", avatar=BOT_ICON):
-            await run_agent_with_streaming(agent, user_input)
+            with st.chat_message("assistant", avatar=BOT_ICON):
+                await run_agent_with_streaming(st.session_state.agent, user_input)
 
-            # Save assistant response to Supabase
-            last_message = st.session_state.messages[-1]
-            if isinstance(last_message, ModelResponse):
-                assistant_response = " ".join(part.content for part in last_message.parts if isinstance(part, TextPart))
-                await save_chat_to_supabase("model", assistant_response, source=agent.agent_scope)
+                # Save assistant response to Supabase
+                last_message = st.session_state.messages[-1]
+                if isinstance(last_message, ModelResponse):
+                    assistant_response = " ".join(part.content for part in last_message.parts if isinstance(part, TextPart))
+                    await save_chat_to_supabase("model", assistant_response, source=st.session_state.agent.agent_scope)
 
 
 def run():

@@ -156,5 +156,5 @@ class WebCrawler:
             await self.process_and_store_document(urls[0], "Sample content")
 
 if __name__ == "__main__":
-    crawler = WebCrawler("pyspark")
-    asyncio.run(crawler.main("https://spark.apache.org/sitemap.xml"))
+    crawler = WebCrawler("google_cloud")
+    asyncio.run(crawler.main("https://cloud.google.com/sitemap.xml"))
